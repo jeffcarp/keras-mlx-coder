@@ -85,3 +85,23 @@ def test_chat_completions_null_max_tokens(monkeypatch):
     response = client.post("/v1/chat/completions", json=payload)
     assert response.status_code == 200
     assert captured_max_tokens == [1024]
+
+
+def test_patch_kerashub_bpe_tokenizer():
+    serve_keras_opencode._patch_kerashub_bpe_tokenizer()
+    try:
+        from keras_hub.src.tokenizers import byte_pair_tokenizer
+        import tensorflow as tf
+
+        unsplittable = ["<|vision_end|>", "<|im_end|>", "<|im_start|>"]
+        test_str = tf.constant(
+            ["<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"]
+        )
+        split_result = byte_pair_tokenizer.split_strings_for_bpe(test_str, unsplittable)
+        tokens = [t.decode("utf-8") for t in split_result.flat_values.numpy()]
+        assert "<|im_start|>" in tokens
+        assert "<|im_end|>" in tokens
+        assert "<|vision_end|>H" not in tokens
+        assert "<|vision_end|>D" not in tokens
+    except ImportError:
+        pass

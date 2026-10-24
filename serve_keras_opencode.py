@@ -69,6 +69,62 @@ def _register_tf_mlx_converter():
         pass
 
 
+def _patch_kerashub_bpe_tokenizer():
+    """Patches KerasHub BytePairTokenizer regex replacement order for special tokens.
+
+    KerasHub assigns prefix-overlapping alternates to unsplittable tokens (e.g.
+    'ĴB' for '<|vision_end|>', 'ĴBD' for '<|im_end|>', 'ĴBH' for '<|im_start|>').
+    Without sorting alternates longest-first on the reverse replacement pass,
+    'ĴB' matches inside 'ĴBH' and 'ĴBD', corrupting '<|im_start|>' into '<|vision_end|>H'
+    and '<|im_end|>' into '<|vision_end|>D'. Sorting alternates longest-first resolves this.
+    """
+    try:
+        import re
+        from keras_hub.src.tokenizers import byte_pair_tokenizer
+        import tensorflow as tf
+
+        orig_split = byte_pair_tokenizer.split_strings_for_bpe
+
+        def patched_split_strings_for_bpe(inputs, unsplittable_tokens=None):
+            if not unsplittable_tokens:
+                return orig_split(inputs, unsplittable_tokens)
+            alts = byte_pair_tokenizer.create_alts_for_unsplittable_tokens(
+                unsplittable_tokens
+            )
+            token_pairs = sorted(
+                zip(unsplittable_tokens, alts), key=lambda x: len(x[0]), reverse=True
+            )
+            alt_pairs = sorted(
+                zip(unsplittable_tokens, alts), key=lambda x: len(x[1]), reverse=True
+            )
+            for token, alt in token_pairs:
+                escaped_token = re.escape(token)
+                inputs = byte_pair_tokenizer.tf_text.regex_split(
+                    inputs, escaped_token, escaped_token
+                )
+                inputs = tf.strings.regex_replace(inputs, escaped_token, alt)
+            raw_tokens = byte_pair_tokenizer.tf_text.regex_split(
+                inputs,
+                byte_pair_tokenizer.SPLIT_PATTERN_1,
+                byte_pair_tokenizer.SPLIT_PATTERN_1,
+            )
+            raw_tokens = byte_pair_tokenizer.tf_text.regex_split(
+                raw_tokens,
+                byte_pair_tokenizer.SPLIT_PATTERN_2,
+                byte_pair_tokenizer.SPLIT_PATTERN_2,
+            )
+            for token, alt in alt_pairs:
+                escaped_alt = re.escape(alt)
+                raw_tokens = tf.strings.regex_replace(raw_tokens, escaped_alt, token)
+            while raw_tokens.shape.rank > 2:
+                raw_tokens = raw_tokens.merge_dims(1, 2)
+            return byte_pair_tokenizer.remove_strings_from_inputs(raw_tokens, "६")
+
+        byte_pair_tokenizer.split_strings_for_bpe = patched_split_strings_for_bpe
+    except Exception:
+        pass
+
+
 def init_model(
     preset: Optional[str] = None,
     chat_format: Optional[str] = None,
@@ -91,6 +147,7 @@ def init_model(
     # Ensure backend is configured
     os.environ["KERAS_BACKEND"] = "mlx"
     _register_tf_mlx_converter()
+    _patch_kerashub_bpe_tokenizer()
     import keras  # noqa: E402
     import keras_hub  # noqa: E402
     import mlx.core as mx  # noqa: E402
