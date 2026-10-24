@@ -33,37 +33,82 @@ formatter: Optional[ChatFormatter] = None
 stop_token_ids: Set[int] = set()
 
 
-def extract_tool_calls(text: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """Extracts <tool_call> JSON blocks from text and returns (cleaned_text, tool_calls)."""
+def extract_tool_calls(
+    text: str, valid_tool_names: Optional[Set[str]] = None
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Extracts tool calls from XML tags, code blocks, or raw JSON objects."""
+    raw_calls = []
+    clean_text = text
+
+    # 1. XML <tool_call> ... </tool_call>
+    tc_matches = list(
+        re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
+    )
+    if tc_matches:
+        for m in tc_matches:
+            try:
+                data = json.loads(m.group(1).strip())
+                if isinstance(data, dict) and "name" in data:
+                    raw_calls.append(data)
+            except Exception:
+                pass
+        clean_text = re.sub(
+            r"<tool_call>\s*(\{.*?\})\s*</tool_call>", "", clean_text, flags=re.DOTALL
+        ).strip()
+
+    # 2. Markdown ```json ... ``` blocks containing name & arguments
+    if not raw_calls:
+        code_matches = list(
+            re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        )
+        for m in code_matches:
+            try:
+                data = json.loads(m.group(1).strip())
+                if (
+                    isinstance(data, dict)
+                    and "name" in data
+                    and ("arguments" in data or "parameters" in data)
+                ):
+                    raw_calls.append(data)
+            except Exception:
+                pass
+        if raw_calls:
+            clean_text = re.sub(
+                r"```(?:json)?\s*(\{.*?\})\s*```", "", clean_text, flags=re.DOTALL
+            ).strip()
+
+    # 3. Raw JSON object
+    if not raw_calls:
+        raw_match = re.search(
+            r"^\s*(\{.*\"name\"\s*:.*\"arguments\"\s*:.*\})\s*$", text, re.DOTALL
+        )
+        if raw_match:
+            try:
+                data = json.loads(raw_match.group(1).strip())
+                if isinstance(data, dict) and "name" in data:
+                    raw_calls.append(data)
+                    clean_text = ""
+            except Exception:
+                pass
+
     tool_calls = []
-    pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
+    for call in raw_calls:
+        name = call.get("name")
+        if valid_tool_names and name not in valid_tool_names:
+            continue
+        args = call.get("arguments", call.get("parameters", {}))
+        args_str = json.dumps(args) if isinstance(args, dict) else str(args or "{}")
+        tool_calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:9]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": args_str,
+                },
+            }
+        )
 
-    matches = list(re.finditer(pattern, text, re.DOTALL))
-    if not matches:
-        return text, []
-
-    for match in matches:
-        raw_json = match.group(1).strip()
-        try:
-            parsed = json.loads(raw_json)
-            name = parsed.get("name")
-            args = parsed.get("arguments", {})
-            args_str = json.dumps(args) if isinstance(args, dict) else str(args)
-            if name:
-                tool_calls.append(
-                    {
-                        "id": f"call_{uuid.uuid4().hex[:9]}",
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": args_str,
-                        },
-                    }
-                )
-        except Exception:
-            pass
-
-    clean_text = re.sub(pattern, "", text, flags=re.DOTALL).strip()
     return clean_text, tool_calls
 
 
@@ -332,19 +377,25 @@ async def chat_completions(request: Request):
     prompt = active_formatter.format_chat(
         messages, tools=tools, add_generation_prompt=True
     )
+    valid_tool_names = (
+        {
+            t["function"]["name"]
+            for t in tools
+            if "function" in t and "name" in t["function"]
+        }
+        if tools
+        else None
+    )
 
     if stream:
 
         async def event_stream():
             try:
                 full_chunks = []
-                in_tool_call = False
-                tool_buffer = []
 
-                async for chunk in generate_stream(prompt, max_tokens=max_tokens):
-                    full_chunks.append(chunk)
-
-                    if not tools:
+                if not tools:
+                    async for chunk in generate_stream(prompt, max_tokens=max_tokens):
+                        full_chunks.append(chunk)
                         payload = {
                             "id": req_id,
                             "object": "chat.completion.chunk",
@@ -359,29 +410,48 @@ async def chat_completions(request: Request):
                             ],
                         }
                         yield f"data: {json.dumps(payload)}\n\n"
-                    else:
-                        if "<tool_call>" in chunk or in_tool_call:
-                            in_tool_call = True
-                            tool_buffer.append(chunk)
-                        else:
-                            payload = {
-                                "id": req_id,
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model_name,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": chunk},
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                            yield f"data: {json.dumps(payload)}\n\n"
 
-                # Check if tool calls were produced
+                    done_payload = {
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(done_payload)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                # When tools are provided, buffer chunks to determine if output is text or tool call
+                async for chunk in generate_stream(prompt, max_tokens=max_tokens):
+                    full_chunks.append(chunk)
+
                 combined = "".join(full_chunks)
-                clean_text, tool_calls = extract_tool_calls(combined)
+                clean_text, tool_calls = extract_tool_calls(
+                    combined, valid_tool_names=valid_tool_names
+                )
+
+                if clean_text:
+                    text_payload = {
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": clean_text},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(text_payload)}\n\n"
 
                 if tool_calls:
                     for tc_idx, tc in enumerate(tool_calls):
@@ -458,7 +528,9 @@ async def chat_completions(request: Request):
         chunks.append(chunk)
     full_content = "".join(chunks)
 
-    clean_content, tool_calls = extract_tool_calls(full_content)
+    clean_content, tool_calls = extract_tool_calls(
+        full_content, valid_tool_names=valid_tool_names
+    )
     finish_reason = "tool_calls" if tool_calls else "stop"
 
     msg: Dict[str, Any] = {
