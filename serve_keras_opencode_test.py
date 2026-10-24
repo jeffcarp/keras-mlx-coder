@@ -105,3 +105,78 @@ def test_patch_kerashub_bpe_tokenizer():
         assert "<|vision_end|>D" not in tokens
     except ImportError:
         pass
+
+
+def test_extract_tool_calls():
+    raw = (
+        "Checking src directory:\n"
+        '<tool_call>\n{"name": "list_dir", "arguments": {"path": "src"}}\n</tool_call>'
+    )
+    clean, tool_calls = serve_keras_opencode.extract_tool_calls(raw)
+    assert clean == "Checking src directory:"
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "list_dir"
+    assert '"path": "src"' in tool_calls[0]["function"]["arguments"]
+
+
+def test_chat_completions_tool_calling(monkeypatch):
+    async def mock_generate_stream(prompt, max_tokens=1024):
+        yield "Checking directory\n"
+        yield '<tool_call>\n{"name": "list_files", "arguments": {"dir": "src"}}\n</tool_call>'
+
+    monkeypatch.setattr(serve_keras_opencode, "generate_stream", mock_generate_stream)
+
+    payload = {
+        "model": "qwen2.5-coder",
+        "messages": [{"role": "user", "content": "List files."}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_files",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"dir": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+        "stream": False,
+    }
+    response = client.post("/v1/chat/completions", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    choice = data["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert len(choice["message"]["tool_calls"]) == 1
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "list_files"
+
+
+def test_chat_completions_tool_calling_streaming(monkeypatch):
+    async def mock_generate_stream(prompt, max_tokens=1024):
+        yield "Checking\n"
+        yield '<tool_call>\n{"name": "list_files", "arguments": {"dir": "src"}}\n</tool_call>'
+
+    monkeypatch.setattr(serve_keras_opencode, "generate_stream", mock_generate_stream)
+
+    payload = {
+        "model": "qwen2.5-coder",
+        "messages": [{"role": "user", "content": "List files."}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_files",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"dir": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+        "stream": True,
+    }
+    response = client.post("/v1/chat/completions", json=payload)
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    assert "tool_calls" in response.text

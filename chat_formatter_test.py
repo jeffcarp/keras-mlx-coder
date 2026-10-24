@@ -94,6 +94,61 @@ def test_get_chat_formatter_auto_detection():
     assert isinstance(get_chat_formatter("unknown_custom_model"), ChatMLFormatter)
 
 
+def test_chatml_formatting_with_tools():
+    formatter = ChatMLFormatter()
+    messages = [
+        {"role": "user", "content": "List files in src/."},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List files in directory",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }
+    ]
+    result = formatter.format_chat(messages, tools=tools, add_generation_prompt=True)
+    assert "<|im_start|>system" in result
+    assert "# Tools" in result
+    assert "<tools>" in result
+    assert "list_dir" in result
+    assert "<tool_call>" in result
+    assert "<|im_start|>user\nList files in src/.<|im_end|>\n" in result
+    assert result.endswith("<|im_start|>assistant\n")
+
+
+def test_chatml_formatting_with_tool_calls_and_responses():
+    formatter = ChatMLFormatter()
+    messages = [
+        {"role": "user", "content": "List files."},
+        {
+            "role": "assistant",
+            "content": "Checking...",
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {"name": "list_dir", "arguments": '{"path": "src"}'},
+                }
+            ],
+        },
+        {"role": "tool", "content": '["main.py", "utils.py"]'},
+    ]
+    result = formatter.format_chat(messages, add_generation_prompt=True)
+    assert (
+        '<tool_call>\n{"name": "list_dir", "arguments": {"path": "src"}}\n</tool_call>'
+        in result
+    )
+    assert '<tool_response>\n["main.py", "utils.py"]\n</tool_response>' in result
+    assert result.endswith("<|im_start|>assistant\n")
+
+
 def test_stop_tokens_resolution():
     class MockTokenizer:
         end_token_id = 999

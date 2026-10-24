@@ -12,9 +12,10 @@ import asyncio
 import atexit
 import json
 import os
+import re
 import time
 import uuid
-from typing import Any, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from chat_formatter import ChatFormatter, get_chat_formatter
 from fastapi import FastAPI, Request
@@ -30,6 +31,40 @@ model: Any = None
 tokenizer: Any = None
 formatter: Optional[ChatFormatter] = None
 stop_token_ids: Set[int] = set()
+
+
+def extract_tool_calls(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Extracts <tool_call> JSON blocks from text and returns (cleaned_text, tool_calls)."""
+    tool_calls = []
+    pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
+
+    matches = list(re.finditer(pattern, text, re.DOTALL))
+    if not matches:
+        return text, []
+
+    for match in matches:
+        raw_json = match.group(1).strip()
+        try:
+            parsed = json.loads(raw_json)
+            name = parsed.get("name")
+            args = parsed.get("arguments", {})
+            args_str = json.dumps(args) if isinstance(args, dict) else str(args)
+            if name:
+                tool_calls.append(
+                    {
+                        "id": f"call_{uuid.uuid4().hex[:9]}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": args_str,
+                        },
+                    }
+                )
+        except Exception:
+            pass
+
+    clean_text = re.sub(pattern, "", text, flags=re.DOTALL).strip()
+    return clean_text, tool_calls
 
 
 def compute_sequence_length(
@@ -283,9 +318,10 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    """OpenAI-compatible chat completion endpoint supporting SSE streaming."""
+    """OpenAI-compatible chat completion endpoint supporting SSE streaming and tool calling."""
     body = await request.json()
     messages = body.get("messages", [])
+    tools = body.get("tools")
     stream = body.get("stream", False)
     raw_max_tokens = body.get("max_tokens")
     max_tokens = int(raw_max_tokens) if raw_max_tokens is not None else 1024
@@ -293,14 +329,88 @@ async def chat_completions(request: Request):
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
     active_formatter = formatter or get_chat_formatter(active_format or active_preset)
-    prompt = active_formatter.format_chat(messages, add_generation_prompt=True)
+    prompt = active_formatter.format_chat(
+        messages, tools=tools, add_generation_prompt=True
+    )
 
     if stream:
 
         async def event_stream():
             try:
+                full_chunks = []
+                in_tool_call = False
+                tool_buffer = []
+
                 async for chunk in generate_stream(prompt, max_tokens=max_tokens):
-                    payload = {
+                    full_chunks.append(chunk)
+
+                    if not tools:
+                        payload = {
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": chunk},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+                    else:
+                        if "<tool_call>" in chunk or in_tool_call:
+                            in_tool_call = True
+                            tool_buffer.append(chunk)
+                        else:
+                            payload = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": chunk},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(payload)}\n\n"
+
+                # Check if tool calls were produced
+                combined = "".join(full_chunks)
+                clean_text, tool_calls = extract_tool_calls(combined)
+
+                if tool_calls:
+                    for tc_idx, tc in enumerate(tool_calls):
+                        tc_payload = {
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "tool_calls": [
+                                            {
+                                                "index": tc_idx,
+                                                "id": tc["id"],
+                                                "type": "function",
+                                                "function": tc["function"],
+                                            }
+                                        ],
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(tc_payload)}\n\n"
+
+                    done_payload = {
                         "id": req_id,
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
@@ -308,28 +418,28 @@ async def chat_completions(request: Request):
                         "choices": [
                             {
                                 "index": 0,
-                                "delta": {"content": chunk},
-                                "finish_reason": None,
+                                "delta": {},
+                                "finish_reason": "tool_calls",
                             }
                         ],
                     }
-                    yield f"data: {json.dumps(payload)}\n\n"
+                    yield f"data: {json.dumps(done_payload)}\n\n"
+                else:
+                    done_payload = {
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(done_payload)}\n\n"
 
-                # Final finish chunk
-                payload_done = {
-                    "id": req_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(payload_done)}\n\n"
                 yield "data: [DONE]\n\n"
             except asyncio.CancelledError:
                 # Client disconnected or cancelled request cleanly
@@ -348,6 +458,16 @@ async def chat_completions(request: Request):
         chunks.append(chunk)
     full_content = "".join(chunks)
 
+    clean_content, tool_calls = extract_tool_calls(full_content)
+    finish_reason = "tool_calls" if tool_calls else "stop"
+
+    msg: Dict[str, Any] = {
+        "role": "assistant",
+        "content": clean_content if (clean_content or not tool_calls) else None,
+    }
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+
     prompt_tok_count = len(tokenizer(prompt)) if tokenizer else len(prompt.split())
     return JSONResponse(
         {
@@ -358,8 +478,8 @@ async def chat_completions(request: Request):
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": full_content},
-                    "finish_reason": "stop",
+                    "message": msg,
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": {

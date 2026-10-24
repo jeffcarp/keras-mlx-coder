@@ -5,6 +5,7 @@ the target model's prompt representation (ChatML, Gemma, Llama 3, etc.) and
 provides stop-token resolution.
 """
 
+import json
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Set
 
@@ -17,7 +18,10 @@ class ChatFormatter(ABC):
 
     @abstractmethod
     def format_chat(
-        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        add_generation_prompt: bool = True,
     ) -> str:
         """Formats a list of message dicts into a prompt string."""
         pass
@@ -60,13 +64,66 @@ class ChatMLFormatter(ChatFormatter):
     stop_strings = ["<|im_end|>", "<|endoftext|>"]
 
     def format_chat(
-        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        add_generation_prompt: bool = True,
     ) -> str:
         formatted = ""
-        for msg in messages:
+        has_system = bool(messages and messages[0].get("role") == "system")
+        system_content = (
+            messages[0].get("content", "")
+            if has_system
+            else "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+        )
+
+        if tools:
+            tool_signatures = "\n".join(json.dumps(t) for t in tools)
+            system_prompt = (
+                f"{system_content}\n\n"
+                f"# Tools\n\n"
+                f"You may call one or more functions to assist with the user query.\n\n"
+                f"You are provided with function signatures within <tools></tools> XML tags:\n"
+                f"<tools>\n{tool_signatures}\n</tools>\n\n"
+                f"For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+                f"<tool_call>\n"
+                f'{{"name": <function-name>, "arguments": <args-json-object>}}\n'
+                f"</tool_call>"
+            )
+            formatted += f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            start_idx = 1 if has_system else 0
+        elif has_system:
+            formatted += f"<|im_start|>system\n{system_content}<|im_end|>\n"
+            start_idx = 1
+        else:
+            start_idx = 0
+
+        for msg in messages[start_idx:]:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            formatted += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+            tool_calls = msg.get("tool_calls", [])
+
+            if role == "tool":
+                formatted += f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n"
+            elif role == "assistant" and tool_calls:
+                call_strs = []
+                if content:
+                    call_strs.append(content)
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments", "{}")
+                    if isinstance(args, dict):
+                        args_str = json.dumps(args)
+                    else:
+                        args_str = str(args)
+                    call_strs.append(
+                        f'<tool_call>\n{{"name": "{fn.get("name")}", "arguments": {args_str}}}\n</tool_call>'
+                    )
+                formatted += (
+                    f"<|im_start|>assistant\n{chr(10).join(call_strs)}<|im_end|>\n"
+                )
+            else:
+                formatted += f"<|im_start|>{role}\n{content}<|im_end|>\n"
 
         if add_generation_prompt:
             formatted += "<|im_start|>assistant\n"
@@ -94,7 +151,10 @@ class GemmaFormatter(ChatFormatter):
     stop_strings = ["<end_of_turn>", "<eos>"]
 
     def format_chat(
-        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        add_generation_prompt: bool = True,
     ) -> str:
         formatted = ""
         system_content = ""
@@ -142,7 +202,10 @@ class Llama3Formatter(ChatFormatter):
     stop_strings = ["<|eot_id|>", "<|end_of_text|>"]
 
     def format_chat(
-        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        add_generation_prompt: bool = True,
     ) -> str:
         formatted = "<|begin_of_text|>"
         for msg in messages:
@@ -170,7 +233,10 @@ class PlainFormatter(ChatFormatter):
     stop_strings = ["\nUser:", "\nSystem:"]
 
     def format_chat(
-        self, messages: List[Dict[str, str]], add_generation_prompt: bool = True
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        add_generation_prompt: bool = True,
     ) -> str:
         formatted = ""
         for msg in messages:
