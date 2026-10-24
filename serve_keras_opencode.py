@@ -95,6 +95,11 @@ def extract_tool_calls(
     for call in raw_calls:
         name = call.get("name")
         if valid_tool_names and name not in valid_tool_names:
+            args = call.get("arguments", {})
+            if isinstance(args, dict) and "message" in args:
+                clean_text = args["message"]
+            elif not clean_text:
+                clean_text = text
             continue
         args = call.get("arguments", call.get("parameters", {}))
         args_str = json.dumps(args) if isinstance(args, dict) else str(args or "{}")

@@ -88,7 +88,8 @@ class ChatMLFormatter(ChatFormatter):
                 f"For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
                 f"<tool_call>\n"
                 f'{{"name": <function-name>, "arguments": <args-json-object>}}\n'
-                f"</tool_call>"
+                f"</tool_call>\n\n"
+                f"If the user query does not require calling any tools, answer in plain text directly without any XML tags or function calls."
             )
             formatted += f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
             start_idx = 1 if has_system else 0
