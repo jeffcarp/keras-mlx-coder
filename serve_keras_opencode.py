@@ -1,71 +1,36 @@
-"""OpenAI-Compatible Local API Server for Qwen 2.5 Coder (KerasHub + MLX).
+"""OpenAI-Compatible Local API Server for SOTA Coding Models (KerasHub + MLX).
 
-Exposes a streaming /v1/chat/completions endpoint accelerated on Apple Silicon GPU
-via KerasHub and the Keras-MLX pluggable backend with fused Metal kernels.
-Enables local coding agents (OpenCode, Aider, Continue) to drive local models.
+Exposes an OpenAI-compatible streaming /v1/chat/completions endpoint
+accelerated on Apple Silicon GPU via KerasHub and the Keras-MLX pluggable
+backend with fused Metal kernels (mx.compile).
+
+Supports any KerasHub CausalLM preset (Qwen 2.5 Coder, Gemma, Llama, etc.).
 """
 
+import argparse
 import asyncio
 import atexit
 import json
 import os
 import time
 import uuid
+from typing import Any, Optional, Set
 
-os.environ["KERAS_BACKEND"] = "mlx"
-import keras  # noqa: E402
-import keras_hub  # noqa: E402
-import mlx.core as mx  # noqa: E402
-from fastapi import FastAPI, Request  # noqa: E402
-from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
-import uvicorn  # noqa: E402
+from chat_formatter import ChatFormatter, get_chat_formatter
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+import uvicorn
 
-if hasattr(mx, "clear_streams"):
-    atexit.register(mx.clear_streams)
-if hasattr(mx, "compile_clear_cache"):
-    atexit.register(mx.compile_clear_cache)
+# Global state for server
+active_preset: str = os.environ.get("MODEL_PRESET", "qwen2.5_coder_instruct_1.5b")
+active_format: Optional[str] = os.environ.get("CHAT_FORMAT", None)
+model: Any = None
+tokenizer: Any = None
+formatter: Optional[ChatFormatter] = None
+stop_token_ids: Set[int] = set()
 
-model = None
-tokenizer = None
-stop_token_ids = set()
-
-
-def init_model(preset=None):
-    """Initializes and compiles the model if not already loaded."""
-    global model, tokenizer, stop_token_ids
-    if model is not None:
-        return model
-
-    preset = preset or os.environ.get("MODEL_PRESET", "qwen2.5_coder_instruct_1.5b")
-    print("=" * 65)
-    print("Starting KerasHub Qwen 2.5 Coder API Server (MLX Backend)")
-    print("=" * 65)
-    print(f"Keras Backend: {keras.config.backend()}")
-    print(f"MLX Device:    {mx.default_device()}")
-
-    print(f"\nLoading model from preset '{preset}' (dtype=bfloat16)...")
-    t0 = time.time()
-    model = keras_hub.models.Qwen2CausalLM.from_preset(preset, dtype="bfloat16")
-    print(f"Model loaded in {time.time() - t0:.2f}s!")
-    print(f"Total Parameters: {model.count_params():,}")
-
-    # Compile single-token decoding forward step for kernel fusion
-    print("Compiling call_with_cache with mx.compile for kernel fusion...")
-    model.call_with_cache = mx.compile(model.call_with_cache)
-
-    tokenizer = model.preprocessor.tokenizer
-    stop_token_ids = {tokenizer.end_token_id}
-    if hasattr(tokenizer, "end_token2_id") and tokenizer.end_token2_id is not None:
-        stop_token_ids.add(tokenizer.end_token2_id)
-    # Qwen special end tokens: <|im_end|> (151645) and <|endoftext|> (151643)
-    for special_id in [151643, 151645]:
-        stop_token_ids.add(special_id)
-
-    return model
-
-
-app = FastAPI(title="KerasHub Qwen Local Server")
+app = FastAPI(title="KerasHub MLX Local OpenAI Server")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -75,20 +40,64 @@ app.add_middleware(
 )
 
 
-def format_chatml(messages):
-    """Formats an OpenAI messages list into Qwen ChatML format."""
-    formatted = ""
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        formatted += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-    formatted += "<|im_start|>assistant\n"
-    return formatted
+def init_model(
+    preset: Optional[str] = None,
+    chat_format: Optional[str] = None,
+    dtype: str = "bfloat16",
+):
+    """Initializes, compiles, and configures the KerasHub CausalLM model."""
+    global active_preset, active_format, model, tokenizer, formatter, stop_token_ids
+
+    if model is not None:
+        return model
+
+    # Ensure backend is configured
+    os.environ["KERAS_BACKEND"] = "mlx"
+    import keras  # noqa: E402
+    import keras_hub  # noqa: E402
+    import mlx.core as mx  # noqa: E402
+
+    if hasattr(mx, "clear_streams"):
+        atexit.register(mx.clear_streams)
+    if hasattr(mx, "compile_clear_cache"):
+        atexit.register(mx.compile_clear_cache)
+
+    active_preset = preset or active_preset
+    active_format = chat_format or active_format
+
+    print("=" * 65)
+    print(f"Starting KerasHub Local Server with Model: {active_preset}")
+    print("=" * 65)
+    print(f"Keras Backend: {keras.config.backend()}")
+    print(f"MLX Device:    {mx.default_device()}")
+    print(f"Dtype:         {dtype}")
+
+    print(f"\nLoading model from preset '{active_preset}'...")
+    t0 = time.time()
+    model = keras_hub.models.CausalLM.from_preset(active_preset, dtype=dtype)
+    print(f"Model loaded in {time.time() - t0:.2f}s!")
+    print(f"Total Parameters: {model.count_params():,}")
+
+    # Compile the single-token forward step to fuse Metal compute kernels
+    print("Compiling call_with_cache with mx.compile for kernel fusion...")
+    model.call_with_cache = mx.compile(model.call_with_cache)
+
+    tokenizer = model.preprocessor.tokenizer
+    formatter = get_chat_formatter(active_format or active_preset)
+    stop_token_ids = formatter.get_stop_token_ids(tokenizer)
+    print(f"Chat Formatter:   {formatter.name}")
+    print(f"Stop Token IDs:   {len(stop_token_ids)} tokens registered")
+
+    return model
 
 
-async def generate_stream(prompt, max_tokens=1024):
+async def generate_stream(prompt: str, max_tokens: int = 1024):
     """Generates tokens streamingly via compiled Keras-MLX decoding on the event loop."""
+    import keras  # noqa: E402
+    import mlx.core as mx  # noqa: E402
+
     init_model()
+
     prompt_tokens = len(tokenizer(prompt))
     # Dynamically scale buffer to fit prompt + max_tokens up to 16k, bucketed to 1024
     needed_len = min(max(prompt_tokens + max_tokens + 64, 2048), 16384)
@@ -118,69 +127,75 @@ async def generate_stream(prompt, max_tokens=1024):
         )
 
         next_token = int(mx.argmax(logits[:, 0, :], axis=-1).item())
-        if next_token in stop_token_ids or next_token >= 151643:
+        if next_token in stop_token_ids:
             break
 
         piece = tokenizer.detokenize([next_token])
-        if piece and not piece.startswith("<|"):
+        if (
+            piece
+            and not piece.startswith("<|")
+            and not piece.startswith("<start_")
+            and not piece.startswith("<end_")
+        ):
             yield piece
             # Yield to event loop to stream chunk immediately and handle disconnects
             await asyncio.sleep(0)
 
-        token_tensor = mx.reshape(mx.array(next_token, dtype=current_prompt.dtype), (1, 1))
-        current_prompt = keras.ops.slice_update(current_prompt, [0, index], token_tensor)
+        token_tensor = mx.reshape(
+            mx.array(next_token, dtype=current_prompt.dtype), (1, 1)
+        )
+        current_prompt = keras.ops.slice_update(
+            current_prompt, [0, index], token_tensor
+        )
         index += 1
 
 
 async def warmup_model():
     """Warms up the compiled Metal graph with a short dummy prompt."""
     print("Warming up compiled graph...")
-    async for _ in generate_stream(
-        "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n", max_tokens=5
-    ):
+    dummy_prompt = formatter.format_chat([{"role": "user", "content": "Hello"}])
+    async for _ in generate_stream(dummy_prompt, max_tokens=5):
         pass
     print("Server ready to accept requests!\n")
 
 
 @app.get("/v1/models")
 async def list_models():
+    """Returns available model descriptors matching the loaded preset."""
+    created_time = int(time.time())
+    active_id = active_preset
+    aliases = [active_id, "default", "qwen2.5-coder"]
+    unique_ids = list(dict.fromkeys(aliases))
+
     return {
         "object": "list",
         "data": [
             {
-                "id": "qwen2.5-coder",
+                "id": mid,
                 "object": "model",
-                "created": int(time.time()),
-                "owned_by": "kerashub-mlx",
-            },
-            {
-                "id": "qwen2.5-coder-1.5b",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "kerashub-mlx",
-            },
-            {
-                "id": "qwen2.5-coder-7b",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "kerashub-mlx",
-            },
+                "created": created_time,
+                "owned_by": "keras-mlx",
+            }
+            for mid in unique_ids
         ],
     }
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    """OpenAI-compatible chat completion endpoint supporting SSE streaming."""
     body = await request.json()
     messages = body.get("messages", [])
     stream = body.get("stream", False)
     max_tokens = body.get("max_tokens", 1024)
-    model_name = body.get("model", "qwen2.5-coder")
+    model_name = body.get("model", active_preset)
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-    prompt = format_chatml(messages)
+    active_formatter = formatter or get_chat_formatter(active_format or active_preset)
+    prompt = active_formatter.format_chat(messages, add_generation_prompt=True)
 
     if stream:
+
         async def event_stream():
             try:
                 async for chunk in generate_stream(prompt, max_tokens=max_tokens):
@@ -227,7 +242,7 @@ async def chat_completions(request: Request):
         chunks.append(chunk)
     full_content = "".join(chunks)
 
-    prompt_tok_count = len(tokenizer(prompt))
+    prompt_tok_count = len(tokenizer(prompt)) if tokenizer else len(prompt.split())
     return JSONResponse(
         {
             "id": req_id,
@@ -250,12 +265,30 @@ async def chat_completions(request: Request):
     )
 
 
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="KerasHub Qwen 2.5 Coder Local API Server")
+def main():
+    parser = argparse.ArgumentParser(
+        description="KerasHub MLX Local OpenAI-Compatible Server for Coding Models"
+    )
     parser.add_argument(
-        "--host", default=os.environ.get("HOST", "127.0.0.1"), help="Host address to bind"
+        "--preset",
+        default=os.environ.get("MODEL_PRESET", "qwen2.5_coder_instruct_1.5b"),
+        help="KerasHub model preset (e.g. qwen2.5_coder_instruct_1.5b, qwen2.5_coder_instruct_7b)",
+    )
+    parser.add_argument(
+        "--chat-format",
+        default=os.environ.get("CHAT_FORMAT", None),
+        choices=["chatml", "gemma", "llama3", "plain", None],
+        help="Chat template format (default: auto-detected from model preset)",
+    )
+    parser.add_argument(
+        "--dtype",
+        default="bfloat16",
+        help="Compute dtype for model weights (default: bfloat16)",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("HOST", "127.0.0.1"),
+        help="Host address to bind (default: 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
@@ -263,15 +296,13 @@ if __name__ == "__main__":
         default=int(os.environ.get("PORT", 8000)),
         help="Port to listen on (default: 8000)",
     )
-    parser.add_argument(
-        "--preset",
-        default=os.environ.get("MODEL_PRESET", "qwen2.5_coder_instruct_1.5b"),
-        help="KerasHub model preset (e.g. qwen2.5_coder_instruct_1.5b, qwen2.5_coder_instruct_7b)",
-    )
     args = parser.parse_args()
 
-    os.environ["MODEL_PRESET"] = args.preset
-    init_model(args.preset)
+    init_model(preset=args.preset, chat_format=args.chat_format, dtype=args.dtype)
     asyncio.run(warmup_model())
     print(f"Listening on http://{args.host}:{args.port}/v1")
     uvicorn.run(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()

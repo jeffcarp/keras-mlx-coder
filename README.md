@@ -2,28 +2,28 @@
 
 Run State-of-the-Art (SOTA) coding models locally on Apple Silicon (M1/M2/M3/M4) using **[Keras 3](https://github.com/keras-team/keras)** and the **[Apple MLX](https://github.com/ml-explore/mlx)** pluggable backend (**[keras-mlx](https://github.com/keras-team/keras-mlx)**).
 
-Accelerate code generation, run local OpenAI-compatible inference servers, and drive autonomous coding agents (OpenCode, Aider, Continue) with zero cloud dependencies, complete privacy, and native macOS sandboxing.
+Accelerate code generation, serve an OpenAI-compatible API locally, and drive autonomous coding agents (OpenCode, Aider, Continue, Cursor) with zero cloud dependencies, full privacy, and native Metal GPU acceleration.
 
 ---
 
 ## ⚡ Highlights
 
-- **Pluggable Keras Backend**: Uses Keras 3's new pluggable backend architecture targeting Apple Silicon's Metal GPU via MLX.
+- **Pluggable Keras Backend**: Leverages Keras 3's pluggable backend architecture targeting Apple Silicon's Metal GPU via MLX.
+- **Unified Multi-Model Server**: Single, high-performance server supporting any [KerasHub](https://github.com/keras-team/keras-hub) causal language model (Qwen 2.5 Coder, Gemma, Llama, etc.).
+- **Automatic Chat Templating**: Built-in template abstraction ([`chat_formatter.py`](file:///Users/jeffcarp/gh/jeffcarp/keras-mlx-coder/chat_formatter.py)) supporting ChatML (Qwen, DeepSeek), Gemma, and Llama 3 formatting with auto-detection.
 - **Compiled Metal Kernel Fusion**: Fuses single-token decoding steps (`model.call_with_cache`) with `mx.compile`, eliminating Python dispatch overhead and unlocking high tokens-per-second streaming.
-- **SOTA Coding Models**: Out-of-the-box support for the **Qwen 2.5 Coder** series (0.5B, 1.5B, 7B, 14B, 32B) and Google **Gemma 3** via [KerasHub](https://github.com/keras-team/keras-hub).
-- **OpenAI-Compatible Streaming API Server**: Built-in FastAPI server exposing `/v1/chat/completions` (Server-Sent Events streaming + non-streaming) and `/v1/models`.
-- **macOS Seatbelt Sandbox**: Includes a native Apple Seatbelt (`sandbox-exec`) sandbox profile that confines coding agents to the workspace, enforces localhost-only networking, and protects sensitive keys (`~/.ssh`, `~/.aws`, `~/.gnupg`).
+- **OpenAI-Compatible Streaming API**: FastAPI server exposing `/v1/chat/completions` (Server-Sent Events streaming + non-streaming) and `/v1/models`.
 
 ---
 
-## 📊 Model Recommendations by Apple Silicon Unified Memory
+## 📊 Model Sizing & Unified Memory Guide
 
-Thanks to Apple Silicon's unified memory architecture, the GPU shares memory directly with system RAM without PCIe bottleneck copying:
+Thanks to Apple Silicon's unified memory architecture, the GPU shares high-bandwidth memory directly with system RAM:
 
-| Model Preset | Parameters | Compute Dtype | Min Unified Memory | Recommended Mac |
+| Model Preset | Parameters | Dtype | Min RAM | Recommended Mac |
 | :--- | :--- | :--- | :--- | :--- |
 | `qwen2.5_coder_instruct_0.5b` | 0.5B | `bfloat16` | 8 GB | Base M1/M2/M3/M4 MacBook Air |
-| `qwen2.5_coder_instruct_1.5b` | 1.5B | `bfloat16` | 8 GB – 16 GB | M1/M2/M3/M4 MacBook Air / Pro |
+| `qwen2.5_coder_instruct_1.5b` *(default)* | 1.5B | `bfloat16` | 8 GB – 16 GB | M1/M2/M3/M4 MacBook Air / Pro |
 | `qwen2.5_coder_instruct_7b` | 7.6B | `bfloat16` | 16 GB – 24 GB | M-series Pro / Max (16GB+) |
 | `qwen2.5_coder_instruct_14b` | 14.7B | `bfloat16` | 32 GB – 48 GB | M-series Pro / Max (36GB+) |
 | `qwen2.5_coder_instruct_32b` | 32.5B | `bfloat16` | 64 GB – 128 GB | M-series Max / Ultra (64GB+) |
@@ -34,13 +34,11 @@ Thanks to Apple Silicon's unified memory architecture, the GPU shares memory dir
 
 ### Prerequisites
 
-- macOS 13.5+ (Sonoma or Sequoia recommended)
-- Apple Silicon Mac (M1, M2, M3, M4 chip family)
+- macOS 13.5+ (Sonoma or Sequoia)
+- Apple Silicon Mac (M1, M2, M3, M4)
 - Python 3.10 or 3.11
 
 ### 1. Installation
-
-Create a clean virtual environment and install dependencies:
 
 ```bash
 # Clone the repository
@@ -51,109 +49,43 @@ cd keras-mlx-coder
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install requirements
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-> **Note on Keras & MLX backend**:
-> The MLX backend is activated by setting `KERAS_BACKEND=mlx`:
-> ```bash
-> export KERAS_BACKEND=mlx
-> ```
+### 2. Launch the Local API Server
+
+Start the server with the default model (Qwen 2.5 Coder 1.5B):
+
+```bash
+python serve_keras_opencode.py
+```
+
+Or specify any supported KerasHub preset or port:
+
+```bash
+# Run 7B coding model on 16GB+ Mac
+python serve_keras_opencode.py --preset qwen2.5_coder_instruct_7b --port 8000
+
+# Run Google Gemma model
+python serve_keras_opencode.py --preset gemma2_instruct_2b_en --port 8000
+```
+
+#### CLI Options
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--preset` | `qwen2.5_coder_instruct_1.5b` | KerasHub model preset |
+| `--chat-format` | `auto` | Chat format (`chatml`, `gemma`, `llama3`, `plain`) |
+| `--dtype` | `bfloat16` | Model compute dtype |
+| `--host` | `127.0.0.1` | Host address to bind |
+| `--port` | `8000` | Port to listen on |
 
 ---
 
-## 🛠️ Step-by-Step Examples
+## 📡 API Usage
 
-All scripts are located in the `examples/` directory.
-
-### 1. Verify Backend and Metal Hardware Acceleration
-
-Check that Keras is configured with the MLX backend and verified on the Metal GPU via DLPack:
-
-```bash
-python examples/1_verify_backend.py
-```
-
-Expected output:
-```text
-============================================================
-1. Keras & MLX Backend Configuration
-============================================================
-Keras Version:      3.16.0
-Configured Backend: mlx
-MLX Version:        0.31.2
-MLX Default Device: Device(gpu, 0)
-MLX Default Stream: Stream(Device(gpu, 0), 0)
-
-============================================================
-2. Tensor & Hardware Verification
-============================================================
-Tensor Type:        <class 'mlx.core.array'>
-Is MLX Array:       True
-DLPack Device:      Metal GPU (id=0)
-...
-Backend verification successful! MLX is running on Apple Silicon GPU.
-```
-
-### 2. Benchmark GPU vs. CPU Performance
-
-Measure matrix multiplication speedup on Apple Silicon Metal GPU vs. CPU:
-
-```bash
-python examples/2_benchmark_device.py
-```
-
-### 3. End-to-End Model Training & Inference
-
-Train a multi-layer perceptron with `model.fit()` on synthetic data, verifying forward pass, backpropagation, and weight updates on the GPU:
-
-```bash
-python examples/3_train_model.py
-```
-
-### 4. Autoregressive Generation with Gemma 3
-
-Run Google's Gemma 3 (270M) foundation model via KerasHub:
-
-```bash
-python examples/4_gemma3_causal_lm.py
-```
-
-*(Note: If running gated models on Hugging Face, run `huggingface-cli login` once beforehand).*
-
-### 5. High-Speed Real-Time Code Streaming (Qwen 2.5 Coder)
-
-Stream code generation token-by-token with single-token forward graph compilation (`mx.compile`):
-
-```bash
-# Run default 1.5B coder model
-python examples/5_qwen2_5_coder.py
-
-# Or specify custom prompt and model preset
-python examples/5_qwen2_5_coder.py \
-  --preset qwen2.5_coder_instruct_7b \
-  --prompt "Write a concurrent thread-pool worker in modern C++20:"
-```
-
----
-
-## 🌐 Local OpenAI-Compatible API Server
-
-Serve Qwen 2.5 Coder locally through a streaming OpenAI-compatible API endpoint:
-
-```bash
-python examples/6_serve_qwen_opencode.py --port 8000
-```
-
-### Features
-- `/v1/chat/completions`: Full support for Server-Sent Events (SSE) streaming (`"stream": true`) and standard JSON responses.
-- `/v1/models`: Returns available model descriptors.
-- ChatML formatting: Properly formats multi-turn chat messages (`<|im_start|>user...<|im_end|>`).
-
-### Test with `curl`
-
-In another terminal, test the streaming chat completion endpoint:
+### Test Streaming with `curl`
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -167,26 +99,28 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+### List Models
+
+```bash
+curl http://localhost:8000/v1/models
+```
+
 ---
 
 ## 🤖 Connecting Coding Agents
 
-Once the server is running on `http://localhost:8000/v1`, you can connect your favorite AI coding agent:
+Once the server is running on `http://localhost:8000/v1`, connect your preferred AI coding tool:
 
-### 1. OpenCode with macOS Seatbelt Sandbox
-
-Run [OpenCode](https://github.com/opencode-ai/opencode) inside Apple's native kernel-enforced Seatbelt sandbox:
+### OpenCode
 
 ```bash
-./examples/sandboxed-opencode.sh
+export OPENAI_BASE_URL="http://localhost:8000/v1"
+export OPENAI_API_KEY="dummy"
+
+opencode --model qwen2.5-coder
 ```
 
-**Security protections enabled by the sandbox**:
-- **Confined Workspace**: Filesystem write operations are restricted strictly to the current project directory and `/tmp`.
-- **Localhost Networking Only**: External internet (outbound WAN) is completely blocked; only connections to `http://localhost:8000` are permitted.
-- **Credential Protection**: Reads to `~/.ssh`, `~/.aws`, `~/.gnupg`, and `~/.credentials` are denied at the OS kernel level.
-
-### 2. Aider
+### Aider
 
 ```bash
 aider \
@@ -195,7 +129,7 @@ aider \
   --model openai/qwen2.5-coder
 ```
 
-### 3. Continue.dev (VS Code / JetBrains)
+### Continue.dev (VS Code / JetBrains)
 
 Add the local model to your `~/.continue/config.json`:
 
@@ -215,9 +149,58 @@ Add the local model to your `~/.continue/config.json`:
 
 ---
 
+## 🔒 Agent Security & macOS Sandboxing
+
+When running autonomous coding agents that write code or execute shell commands, you can enforce kernel-level isolation using macOS Seatbelt (`sandbox-exec`).
+
+Here is a sandbox wrapper recipe that:
+- Confines filesystem writes strictly to your project workspace and `/tmp`.
+- Blocks outbound internet access, permitting network requests *only* to `localhost:8000`.
+- Blocks read access to sensitive keys (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.credentials`).
+
+```bash
+#!/usr/bin/env bash
+WORKSPACE="$(pwd)"
+USER_HOME="$HOME"
+
+PROFILE="(version 1)
+(allow default)
+
+;; 1. Network: Localhost only (talks to local Keras MLX server), blocks WAN
+(deny network-outbound)
+(allow network-outbound (to ip \"localhost:*\"))
+(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))
+(allow network-outbound (regex #\"^/dev/\"))
+
+;; 2. Filesystem Writes: Confined to workspace, /tmp, and agent caches
+(deny file-write*)
+(allow file-write* (subpath \"$WORKSPACE\"))
+(allow file-write* (subpath \"/tmp\"))
+(allow file-write* (subpath \"/private/tmp\"))
+(allow file-write* (subpath \"/private/var/folders\"))
+(allow file-write* (subpath \"/dev\"))
+(allow file-write* (subpath \"$USER_HOME/.local/share/opencode\"))
+(allow file-write* (subpath \"$USER_HOME/.cache/opencode\"))
+(allow file-write* (subpath \"$USER_HOME/.config/opencode\"))
+
+;; 3. Sensitive Reads: Block credentials
+(deny file-read* (subpath \"$USER_HOME/.ssh\"))
+(deny file-read* (subpath \"$USER_HOME/.aws\"))
+(deny file-read* (subpath \"$USER_HOME/.gnupg\"))
+(deny file-read* (subpath \"$USER_HOME/.credentials\"))
+"
+
+export OPENAI_BASE_URL="http://localhost:8000/v1"
+export OPENAI_API_KEY="dummy"
+
+exec /usr/bin/sandbox-exec -p "$PROFILE" opencode --model qwen2.5-coder "$@"
+```
+
+---
+
 ## 🧪 Testing
 
-Run unit and integration tests with pytest:
+Run unit tests with pytest:
 
 ```bash
 python -m pytest
