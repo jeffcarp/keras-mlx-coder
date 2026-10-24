@@ -1,0 +1,12 @@
+# Core Keras & MLX dependencies
+keras>=3.6.0
+keras-hub>=0.27.0
+mlx>=0.24.0
+keras-mlx>=0.0.1
+
+# API server & serving
+fastapi>=0.100.0
+uvicorn>=0.20.0
+
+# Testing
+pytest>=7.0.0
