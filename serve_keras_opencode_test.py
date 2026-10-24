@@ -54,3 +54,34 @@ def test_chat_completions_streaming_mocked(monkeypatch):
     assert "text/event-stream" in response.headers["content-type"]
     lines = [line for line in response.text.split("\n\n") if line.strip()]
     assert any("[DONE]" in line for line in lines)
+
+
+def test_compute_sequence_length():
+    # Small prompt gets bucketed to 1024
+    assert serve_keras_opencode.compute_sequence_length(50, 100, 4096) == 1024
+    # Medium prompt scales up to nearest 1024 bucket
+    assert serve_keras_opencode.compute_sequence_length(1500, 1000, 4096) == 3072
+    # Large prompt + max_tokens capped at max_sequence_length
+    assert serve_keras_opencode.compute_sequence_length(2000, 16384, 4096) == 4096
+    # Exact ceiling
+    assert serve_keras_opencode.compute_sequence_length(5000, 5000, 8192) == 8192
+
+
+def test_chat_completions_null_max_tokens(monkeypatch):
+    captured_max_tokens = []
+
+    async def mock_generate_stream(prompt, max_tokens=1024):
+        captured_max_tokens.append(max_tokens)
+        yield "def foo(): pass"
+
+    monkeypatch.setattr(serve_keras_opencode, "generate_stream", mock_generate_stream)
+
+    payload = {
+        "model": "qwen2.5-coder",
+        "messages": [{"role": "user", "content": "Write a func."}],
+        "max_tokens": None,
+        "stream": False,
+    }
+    response = client.post("/v1/chat/completions", json=payload)
+    assert response.status_code == 200
+    assert captured_max_tokens == [1024]

@@ -25,10 +25,22 @@ import uvicorn
 # Global state for server
 active_preset: str = os.environ.get("MODEL_PRESET", "qwen2.5_coder_instruct_1.5b")
 active_format: Optional[str] = os.environ.get("CHAT_FORMAT", None)
+active_max_sequence_length: int = int(os.environ.get("MAX_SEQUENCE_LENGTH", 4096))
 model: Any = None
 tokenizer: Any = None
 formatter: Optional[ChatFormatter] = None
 stop_token_ids: Set[int] = set()
+
+
+def compute_sequence_length(
+    prompt_tokens: int,
+    max_tokens: int,
+    max_sequence_length: int = 4096,
+) -> int:
+    """Computes bucketed sequence length capped at max_sequence_length to avoid OOM."""
+    needed = min(max(prompt_tokens + max_tokens + 64, 1024), max_sequence_length)
+    return min(((needed + 1023) // 1024) * 1024, max_sequence_length)
+
 
 app = FastAPI(title="KerasHub MLX Local OpenAI Server")
 app.add_middleware(
@@ -61,9 +73,17 @@ def init_model(
     preset: Optional[str] = None,
     chat_format: Optional[str] = None,
     dtype: str = "bfloat16",
+    max_sequence_length: Optional[int] = None,
 ):
     """Initializes, compiles, and configures the KerasHub CausalLM model."""
-    global active_preset, active_format, model, tokenizer, formatter, stop_token_ids
+    global \
+        active_preset, \
+        active_format, \
+        active_max_sequence_length, \
+        model, \
+        tokenizer, \
+        formatter, \
+        stop_token_ids
 
     if model is not None:
         return model
@@ -82,6 +102,8 @@ def init_model(
 
     active_preset = preset or active_preset
     active_format = chat_format or active_format
+    if max_sequence_length is not None:
+        active_max_sequence_length = max_sequence_length
 
     print("=" * 65)
     print(f"Starting KerasHub Local Server with Model: {active_preset}")
@@ -116,10 +138,12 @@ async def generate_stream(prompt: str, max_tokens: int = 1024):
 
     init_model()
 
-    prompt_tokens = len(tokenizer(prompt))
-    # Dynamically scale buffer to fit prompt + max_tokens up to 16k, bucketed to 1024
-    needed_len = min(max(prompt_tokens + max_tokens + 64, 2048), 16384)
-    seq_len = ((needed_len + 1023) // 1024) * 1024
+    prompt_tokens = len(tokenizer(prompt)) if tokenizer else len(prompt.split())
+    seq_len = compute_sequence_length(
+        prompt_tokens=prompt_tokens,
+        max_tokens=max_tokens,
+        max_sequence_length=active_max_sequence_length,
+    )
 
     inputs = model.preprocessor.generate_preprocess([prompt], sequence_length=seq_len)
     token_ids = inputs["token_ids"]
@@ -143,6 +167,7 @@ async def generate_stream(prompt: str, max_tokens: int = 1024):
             current_cache,
             idx_arr,
         )
+        mx.eval(logits, current_cache)
 
         next_token = int(mx.argmax(logits[:, 0, :], axis=-1).item())
         if next_token in stop_token_ids:
@@ -205,7 +230,8 @@ async def chat_completions(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
     stream = body.get("stream", False)
-    max_tokens = body.get("max_tokens", 1024)
+    raw_max_tokens = body.get("max_tokens")
+    max_tokens = int(raw_max_tokens) if raw_max_tokens is not None else 1024
     model_name = body.get("model", active_preset)
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
@@ -251,6 +277,11 @@ async def chat_completions(request: Request):
             except asyncio.CancelledError:
                 # Client disconnected or cancelled request cleanly
                 pass
+            except Exception as e:
+                print(f"Error during streaming generation: {e}")
+                err_payload = {"error": {"message": str(e), "type": "server_error"}}
+                yield f"data: {json.dumps(err_payload)}\n\n"
+                yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -304,6 +335,12 @@ def main():
         help="Compute dtype for model weights (default: bfloat16)",
     )
     parser.add_argument(
+        "--max-sequence-length",
+        type=int,
+        default=int(os.environ.get("MAX_SEQUENCE_LENGTH", 4096)),
+        help="Maximum sequence length buffer cap (default: 4096). Caps Metal memory allocation.",
+    )
+    parser.add_argument(
         "--host",
         default=os.environ.get("HOST", "127.0.0.1"),
         help="Host address to bind (default: 127.0.0.1)",
@@ -316,7 +353,12 @@ def main():
     )
     args = parser.parse_args()
 
-    init_model(preset=args.preset, chat_format=args.chat_format, dtype=args.dtype)
+    init_model(
+        preset=args.preset,
+        chat_format=args.chat_format,
+        dtype=args.dtype,
+        max_sequence_length=args.max_sequence_length,
+    )
     asyncio.run(warmup_model())
     print(f"Listening on http://{args.host}:{args.port}/v1")
     uvicorn.run(app, host=args.host, port=args.port)

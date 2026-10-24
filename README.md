@@ -78,6 +78,7 @@ python serve_keras_opencode.py --preset gemma2_instruct_2b_en --port 8000
 | `--preset` | `qwen2.5_coder_instruct_1.5b` | KerasHub model preset |
 | `--chat-format` | `auto` | Chat format (`chatml`, `gemma`, `llama3`, `plain`) |
 | `--dtype` | `bfloat16` | Model compute dtype |
+| `--max-sequence-length` | `4096` | Max sequence buffer cap (safeguards Metal allocation) |
 | `--host` | `127.0.0.1` | Host address to bind |
 | `--port` | `8000` | Port to listen on |
 
