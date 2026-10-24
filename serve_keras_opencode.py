@@ -40,6 +40,23 @@ app.add_middleware(
 )
 
 
+def _register_tf_mlx_converter():
+    """Registers mlx.core.array converter for TensorFlow to support KerasHub tokenizers."""
+    try:
+        import mlx.core as mx
+        import numpy as np
+        import tensorflow as tf
+
+        tf.register_tensor_conversion_function(
+            mx.array,
+            lambda val, dtype=None, name=None, as_ref=False: tf.convert_to_tensor(
+                np.array(val), dtype=dtype, name=name
+            ),
+        )
+    except Exception:
+        pass
+
+
 def init_model(
     preset: Optional[str] = None,
     chat_format: Optional[str] = None,
@@ -53,6 +70,7 @@ def init_model(
 
     # Ensure backend is configured
     os.environ["KERAS_BACKEND"] = "mlx"
+    _register_tf_mlx_converter()
     import keras  # noqa: E402
     import keras_hub  # noqa: E402
     import mlx.core as mx  # noqa: E402
