@@ -392,11 +392,37 @@ async def chat_completions(request: Request):
         else None
     )
 
+    print(
+        f"\n--- [REQUEST] msgs: {len(messages)}, tools: {len(tools) if tools else 0}, stream: {stream}"
+    )
+    for idx, m in enumerate(messages[-3:]):
+        print(f"  msg[-{3 - idx}] ({m.get('role')}): {repr(m.get('content'))[:120]}")
+    if tools:
+        print(
+            f"  tools: {[t.get('function', {}).get('name') for t in tools if 'function' in t]}"
+        )
+
     if stream:
 
         async def event_stream():
             try:
                 full_chunks = []
+
+                # Emit initial role chunk per OpenAI streaming standard
+                role_payload = {
+                    "id": req_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": ""},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(role_payload)}\n\n"
 
                 if not tools:
                     async for chunk in generate_stream(prompt, max_tokens=max_tokens):
@@ -441,6 +467,10 @@ async def chat_completions(request: Request):
                 clean_text, tool_calls = extract_tool_calls(
                     combined, valid_tool_names=valid_tool_names
                 )
+                print(f"--- [GENERATED] len={len(combined)}: {repr(combined)[:200]}")
+                print(
+                    f"--- [PARSED] clean_text={repr(clean_text)[:100]}, tool_calls={tool_calls}"
+                )
 
                 if clean_text:
                     text_payload = {
@@ -469,7 +499,6 @@ async def chat_completions(request: Request):
                                 {
                                     "index": 0,
                                     "delta": {
-                                        "role": "assistant",
                                         "tool_calls": [
                                             {
                                                 "index": tc_idx,
