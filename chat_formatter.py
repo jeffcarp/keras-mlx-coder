@@ -10,6 +10,26 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Set
 
 
+def extract_text_content(content: Any) -> str:
+    """Extracts plain text from string or structured content parts (e.g. AI SDK)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict):
+                if p.get("type") == "text":
+                    parts.append(p.get("text", ""))
+                elif "text" in p:
+                    parts.append(str(p["text"]))
+        return "".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
 class ChatFormatter(ABC):
     """Base class for model chat formatting."""
 
@@ -72,7 +92,7 @@ class ChatMLFormatter(ChatFormatter):
         formatted = ""
         has_system = bool(messages and messages[0].get("role") == "system")
         system_content = (
-            messages[0].get("content", "")
+            extract_text_content(messages[0].get("content", ""))
             if has_system
             else "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
         )
@@ -88,8 +108,7 @@ class ChatMLFormatter(ChatFormatter):
                 f"For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
                 f"<tool_call>\n"
                 f'{{"name": <function-name>, "arguments": <args-json-object>}}\n'
-                f"</tool_call>\n\n"
-                f"If the user query does not require calling any tools, answer in plain text directly without any XML tags or function calls."
+                f"</tool_call>"
             )
             formatted += f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
             start_idx = 1 if has_system else 0
@@ -101,7 +120,7 @@ class ChatMLFormatter(ChatFormatter):
 
         for msg in messages[start_idx:]:
             role = msg.get("role", "user")
-            content = msg.get("content", "")
+            content = extract_text_content(msg.get("content", ""))
             tool_calls = msg.get("tool_calls", [])
 
             if role == "tool":
@@ -163,7 +182,7 @@ class GemmaFormatter(ChatFormatter):
         # Gemma doesn't have a native system role; prepend system prompt to first user turn
         for msg in messages:
             role = msg.get("role", "user")
-            content = msg.get("content", "")
+            content = extract_text_content(msg.get("content", ""))
 
             if role == "system":
                 system_content += f"{content}\n\n"
@@ -211,7 +230,7 @@ class Llama3Formatter(ChatFormatter):
         formatted = "<|begin_of_text|>"
         for msg in messages:
             role = msg.get("role", "user")
-            content = msg.get("content", "")
+            content = extract_text_content(msg.get("content", ""))
             formatted += (
                 f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
             )
@@ -242,7 +261,7 @@ class PlainFormatter(ChatFormatter):
         formatted = ""
         for msg in messages:
             role = msg.get("role", "user").capitalize()
-            content = msg.get("content", "")
+            content = extract_text_content(msg.get("content", ""))
             formatted += f"{role}: {content}\n\n"
 
         if add_generation_prompt:

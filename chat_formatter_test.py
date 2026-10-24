@@ -164,3 +164,10 @@ def test_stop_tokens_resolution():
     assert 998 in stop_ids
     assert 151645 in stop_ids
     assert 151643 in stop_ids
+
+
+def test_multipart_content_formatting():
+    formatter = ChatMLFormatter()
+    messages = [{"role": "user", "content": [{"type": "text", "text": "Hello world"}]}]
+    result = formatter.format_chat(messages, add_generation_prompt=True)
+    assert "<|im_start|>user\nHello world<|im_end|>\n<|im_start|>assistant\n" == result

@@ -26,7 +26,7 @@ import uvicorn
 # Global state for server
 active_preset: str = os.environ.get("MODEL_PRESET", "qwen2.5_coder_instruct_1.5b")
 active_format: Optional[str] = os.environ.get("CHAT_FORMAT", None)
-active_max_sequence_length: int = int(os.environ.get("MAX_SEQUENCE_LENGTH", 4096))
+active_max_sequence_length: int = int(os.environ.get("MAX_SEQUENCE_LENGTH", 8192))
 model: Any = None
 tokenizer: Any = None
 formatter: Optional[ChatFormatter] = None
@@ -120,7 +120,7 @@ def extract_tool_calls(
 def compute_sequence_length(
     prompt_tokens: int,
     max_tokens: int,
-    max_sequence_length: int = 4096,
+    max_sequence_length: int = 8192,
 ) -> int:
     """Computes bucketed sequence length capped at max_sequence_length to avoid OOM."""
     needed = min(max(prompt_tokens + max_tokens + 64, 1024), max_sequence_length)
@@ -280,24 +280,50 @@ async def generate_stream(prompt: str, max_tokens: int = 1024):
 
     init_model()
 
-    prompt_tokens = len(tokenizer(prompt)) if tokenizer else len(prompt.split())
+    raw_tokens = tokenizer(prompt) if tokenizer else mx.array([], dtype=mx.int32)
+    prompt_tokens = len(raw_tokens)
     seq_len = compute_sequence_length(
         prompt_tokens=prompt_tokens,
         max_tokens=max_tokens,
         max_sequence_length=active_max_sequence_length,
     )
 
-    inputs = model.preprocessor.generate_preprocess([prompt], sequence_length=seq_len)
-    token_ids = inputs["token_ids"]
-    padding_mask = inputs["padding_mask"]
+    # Guarantee generation budget: ensure at least min_gen_budget tokens remain
+    min_gen_budget = min(max_tokens, 512)
+    max_prompt_allowed = max(seq_len - min_gen_budget, 1)
+    if prompt_tokens > max_prompt_allowed:
+        print(
+            f"--- [TRUNCATE] Left-truncating prompt from {prompt_tokens} to {max_prompt_allowed} tokens (seq_len={seq_len})"
+        )
+        raw_tokens = raw_tokens[-max_prompt_allowed:]
+        prompt_tokens = len(raw_tokens)
+
+    prompt_len = prompt_tokens
+    pad_len = seq_len - prompt_len
+
+    token_ids = mx.concatenate(
+        [raw_tokens, mx.zeros((pad_len,), dtype=raw_tokens.dtype)]
+    )
+    padding_mask = mx.concatenate(
+        [
+            mx.ones((prompt_len,), dtype=mx.bool_),
+            mx.zeros((pad_len,), dtype=mx.bool_),
+        ]
+    )
+    token_ids = mx.expand_dims(token_ids, 0)
+    padding_mask = mx.expand_dims(padding_mask, 0)
 
     hidden_states, cache = model._build_cache(token_ids)
-    prompt_length = int(keras.ops.sum(keras.ops.cast(padding_mask, "int32")).item())
+    prompt_length = prompt_len
 
     current_prompt = token_ids
     current_cache = cache
     index = prompt_length
     max_len = min(prompt_length + max_tokens, seq_len)
+
+    print(
+        f"--- [GENERATE] prompt_len={prompt_length}, seq_len={seq_len}, max_len={max_len}, budget={max_len - index}"
+    )
 
     while index < max_len:
         cache_update_index = index - 1
@@ -313,6 +339,9 @@ async def generate_stream(prompt: str, max_tokens: int = 1024):
 
         next_token = int(mx.argmax(logits[:, 0, :], axis=-1).item())
         if next_token in stop_token_ids:
+            print(
+                f"--- [STOP] stop_token_id={next_token} ('{tokenizer.detokenize([next_token])}') at step {index - prompt_length}"
+            )
             break
 
         piece = tokenizer.detokenize([next_token])
@@ -374,7 +403,14 @@ async def chat_completions(request: Request):
     tools = body.get("tools")
     stream = body.get("stream", False)
     raw_max_tokens = body.get("max_tokens")
-    max_tokens = int(raw_max_tokens) if raw_max_tokens is not None else 1024
+    if raw_max_tokens is None:
+        raw_max_tokens = body.get("max_completion_tokens")
+    try:
+        max_tokens = int(raw_max_tokens) if raw_max_tokens is not None else 1024
+    except (ValueError, TypeError):
+        max_tokens = 1024
+    if max_tokens <= 0:
+        max_tokens = 1024
     model_name = body.get("model", active_preset)
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
@@ -620,8 +656,8 @@ def main():
     parser.add_argument(
         "--max-sequence-length",
         type=int,
-        default=int(os.environ.get("MAX_SEQUENCE_LENGTH", 4096)),
-        help="Maximum sequence length buffer cap (default: 4096). Caps Metal memory allocation.",
+        default=int(os.environ.get("MAX_SEQUENCE_LENGTH", 8192)),
+        help="Maximum sequence length buffer cap (default: 8192). Caps Metal memory allocation.",
     )
     parser.add_argument(
         "--host",

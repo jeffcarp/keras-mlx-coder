@@ -180,3 +180,23 @@ def test_chat_completions_tool_calling_streaming(monkeypatch):
     assert response.status_code == 200
     assert "text/event-stream" in response.headers["content-type"]
     assert "tool_calls" in response.text
+
+
+def test_chat_completions_max_completion_tokens(monkeypatch):
+    captured_max_tokens = []
+
+    async def mock_generate_stream(prompt, max_tokens=1024):
+        captured_max_tokens.append(max_tokens)
+        yield "response"
+
+    monkeypatch.setattr(serve_keras_opencode, "generate_stream", mock_generate_stream)
+
+    payload = {
+        "model": "qwen2.5-coder",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_completion_tokens": 2048,
+        "stream": False,
+    }
+    response = client.post("/v1/chat/completions", json=payload)
+    assert response.status_code == 200
+    assert captured_max_tokens == [2048]
